@@ -73,7 +73,7 @@ Used properly, fusion combines the intelligence AND the context windows of your 
   <img src="images/svg-03-three-commands.svg" alt="/opinion — side by side, /fusion — merged via a fusion agent, /auto-validate — validator gate + builder loop" width="780">
 </p>
 
-One extension file registers three slash commands. Every agent is a spawned `pi --mode json -p` subprocess with a fully qualified `provider/id` model, per-role thinking level, and artifacts under `/tmp/fusion-harness-*` (never inside this repo).
+One extension file registers three slash commands. Every agent is a spawned child subprocess — by default `pi --mode json -p` with a fully qualified `provider/id` model, or optionally `claude -p` (Claude Code CLI) per role via `--architect-backend` / `--builder-backend` — with per-role thinking level and artifacts under `/tmp/fusion-harness-*` (never inside this repo).
 
 Children are deliberately **clean-room**: every spawn gets `--no-skills --no-extensions --no-context-files`. `--no-extensions` keeps a child from recursively loading this harness; `--no-skills` / `--no-context-files` keep spawns lean and deterministic — each worker's entire contract comes from the harness's prompt files, identical on any machine regardless of what skills are installed. Only the HOST (raw chat) loads your skills and context files; children never do, even the builder children that fork the host session (a fork copies conversation history, but each child rebuilds its own system prompt from its own flags).
 
@@ -223,6 +223,30 @@ fusion-harness/
 
 ---
 
+## Child backends (pi vs claude-cli)
+
+Runtime ≠ model ≠ role. Each side can run on a different **child backend**:
+
+| Backend | Process | Auth / billing | Best for |
+|---|---|---|---|
+| `pi` (default) | `pi --mode json -p --model provider/id` | pi `auth.json` / env API keys; Anthropic OAuth in pi is **extra usage** | OpenAI builder, API-key Anthropic, openai-codex subscription path |
+| `claude-cli` | `claude -p --output-format stream-json` | Claude Code login — **normal Claude subscription usage** | ARCHITECT / VALIDATOR / FUSION on plan limits |
+
+```bash
+# Architect on Claude Code subscription; builder stays on pi (host chat unchanged)
+just fh-sota-sub
+
+# Equivalent flags
+just fh-workhorse --architect-backend claude-cli --architect sonnet
+```
+
+Notes:
+
+- Host raw chat is still pi on the builder model. Only **spawned children** use `claude-cli`.
+- `claude-cli` cannot fork the pi host session; builder children on that backend use the harness's persistent session id / `--resume` instead.
+- Requires `claude` on `PATH` (override with `CLAUDE_CLI`). Sign in once interactively. Do **not** use Claude `--bare` (it forces API-key-only auth).
+- Tool matrices map to Claude `--permission-mode dontAsk` + allowlists; full write+bash uses `--dangerously-skip-permissions` (headless-safe, no approval prompts).
+
 ## Recipes
 
 <p align="center">
@@ -233,14 +257,16 @@ Role ≠ model. Models change quarterly; the harness compounds. Two model tiers 
 
 | Tier | Architect | Builder | Recipe |
 |---|---|---|---|
-| **WORKHORSE** | `anthropic/claude-sonnet-5` | `openai/gpt-5.6-terra` | `just fh-workhorse` |
-| **STATE-OF-THE-ART** | `anthropic/claude-fable-5` | `openai/gpt-5.6-sol` | `just fh-sota` |
-
-Two ways to run it — everything else is a flag.
+| **WORKHORSE** | `anthropic/claude-sonnet-5` (pi) | `openai/gpt-5.6-terra` (pi) | `just fh-workhorse` |
+| **STATE-OF-THE-ART** | `anthropic/claude-fable-5` (pi) | `openai/gpt-5.6-sol` (pi) | `just fh-sota` |
+| **WORKHORSE-SUB** | `sonnet` (`claude-cli`) | `openai/gpt-5.6-sol` (pi) | `just fh-workhorse-sub` |
+| **SOTA-SUB** | `sonnet` (`claude-cli`) | `openai/gpt-5.6-sol` (pi) | `just fh-sota-sub` |
 
 ```
 just fh-workhorse       # WORKHORSE tier (use this for testing)
 just fh-sota            # STATE-OF-THE-ART tier (fable plans · sol builds + hosts)
+just fh-workhorse-sub   # architect via Claude Code subscription (`claude -p`)
+just fh-sota-sub        # same, higher thinking
 ```
 
 All flags append to either recipe, e.g. `just fh-workhorse --architect-thinking high --builder-system-prompt ./persona.md`, or `just fh-sota --architect-thinking max --builder-thinking max` to push both roles to max thinking.
@@ -257,8 +283,10 @@ That is what a full SOTA run produces end to end: spec in, two perspectives, one
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--architect <provider/id>` | `anthropic/claude-fable-5` | plans / fuses / validates |
-| `--builder <provider/id>` | `openai/gpt-5.6-sol` | builds |
+| `--architect <provider/id\|alias>` | `anthropic/claude-fable-5` | plans / fuses / validates |
+| `--builder <provider/id\|alias>` | `openai/gpt-5.6-sol` | builds |
+| `--architect-backend pi\|claude-cli` | `pi` | child runtime for architect-family (worker/fusion/validator/triage) |
+| `--builder-backend pi\|claude-cli` | `pi` | child runtime for builder children (host chat stays pi) |
 | `--architect-thinking <level>` | `medium` | thinking for EVERY architect-family execution (worker/fusion/validator/triage) — `off\|minimal\|low\|medium\|high\|xhigh\|max` |
 | `--builder-thinking <level>` | `medium` | thinking for EVERY builder execution — same levels |
 | `--architect-system-prompt <text\|path>` | pi default | system prompt for architect worker/fusion agents (VALIDATOR/TRIAGE keep their `SYSTEM_PROMPT_*.md` contracts) |
@@ -308,6 +336,7 @@ Two models cover more blind spots than one, and the matrix is honest about the r
 - **Parallel writers share one cwd**: `/fusion`'s two workers run concurrently with full tools, so their prompt requires an identity-in-filename (`-ARCHITECT-<model>`) on everything they create. Two agents told to write the same bare path would race and clobber each other — if you ask for one exactly-named file, let the FUSION merge produce it. (`/opinion` children stay read-only/bash-only: it's an A/B read, not a build.)
 - **Stale role memories**: the ARCHITECT session persists per project + model across restarts. If it starts reasoning from an old context, `/fh-reset` gives both roles a clean brain.
 - **Anthropic usage-policy blocks on fable-5**: Fable ships stricter safety classifiers, and a long accumulated agent transcript can false-positive — observed when a sonnet-built session (turns saying "you are claude-sonnet-5" + script execution) was replayed into fable-5: every request blocked at the API, even `/opinion hello`, while the same prompt on a fresh session passed. The per-model session keying prevents the cross-model case; if a block ever recurs on a long same-model session, `/fh-reset` (or `/new`) clears it.
+- **Claude subscription vs pi OAuth**: using Anthropic through pi OAuth bills **extra usage**. Prefer `--architect-backend claude-cli` (or `just fh-*-sub`) so architect-family work runs under Claude Code subscription usage.
 - **Headless hosts can't fork**: with `--no-session` (headless runs), builder children fall back to a manifest-pinned persistent session instead of forking the host.
 
 ---

@@ -38,13 +38,18 @@
  *     render the two answers side by side as real markdown columns.
  *   - Failures are attributed to the specific role+model with the real error.
  *
- * Plumbing: every agent is a spawned `pi --mode json -p` subprocess with a
- * fully-qualified `provider/id` model and a throwaway --session-dir under a
- * per-run /tmp/fusion-harness-* artifacts dir. Nothing is written to the repo.
+ * Plumbing: every agent is a spawned child subprocess with a throwaway
+ * --session-dir under a per-run /tmp/fusion-harness-* artifacts dir. Nothing is
+ * written to the repo. Child runtime is selectable per role:
+ *
+ *   pi          `pi --mode json -p --model provider/id` (default)
+ *   claude-cli  `claude -p --output-format stream-json` (Claude Code subscription)
  *
  * Flags:
- *   --architect <provider/id>   plans / fuses / validates  (default anthropic/claude-fable-5)
- *   --builder   <provider/id>   builds                     (default openai/gpt-5.6-sol)
+ *   --architect <provider/id|alias>   plans / fuses / validates
+ *   --builder   <provider/id|alias>   builds
+ *   --architect-backend pi|claude-cli  default pi
+ *   --builder-backend   pi|claude-cli  default pi
  *
  * Launch:  pi -e extensions/fusion-harness/fusion-harness.ts
  *
@@ -54,7 +59,7 @@
  *   3. Types               — AgentRun (live child state), AgentStat, FhDetails (panel payloads)
  *   4. Small helpers       — formatting, truncation, run bookkeeping
  *   5. Two-column layout   — TwoCol / FullWidth, the core rendering primitives
- *   6. Child runner        — runChild (pi subprocess + JSON event stream), runProc (the gate)
+ *   6. Child runner        — runChild (pi | claude-cli backends), runProc (the gate)
  *   7. Prompts             — file-backed templates ({{VAR}} interpolation) + builders
  *   8. Extension           — flags, sessions, footer, renderer, and the commands:
  *                            /fh-reset · /thinking · /system-prompt · /fusion ·
@@ -73,6 +78,10 @@ import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapText
 
 const DEFAULT_ARCHITECT = "anthropic/claude-fable-5"; // plans, fuses, validates
 const DEFAULT_BUILDER = "openai/gpt-5.6-sol"; // builds (and hosts — see the launch recipes)
+const DEFAULT_BACKEND = "pi" as const; // child runtime — pi JSON mode, or Claude Code CLI
+
+/** How a child agent is executed. Runtime ≠ model ≠ role. */
+type ChildBackend = "pi" | "claude-cli";
 
 const READONLY_TOOLS = "read,grep,find,ls"; // parallel agents share a cwd — concurrent writers would collide
 const OPINION_TOOLS = "read,grep,find,ls,bash"; // everything except write/edit
@@ -431,27 +440,160 @@ function mdLines(text: string, colW: number): string[] {
 
 // ═══ 6. Child runner ═════════════════════════════════════════════════════════
 
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** Shared spawn options for every child backend. */
+interface RunChildOpts {
+	run: AgentRun; // mutated live
+	backend?: ChildBackend; // default pi
+	prompt: string;
+	systemPrompt?: string;
+	tools: string | "none";
+	thinking: ThinkingLevel;
+	sessionDir: string;
+	sessionId?: string; // stable per-role session — the agent keeps its context across commands
+	fork?: string; // pi only: fork this session FILE (copy-on-write) — inherits host context
+	resume?: string; // resume this session id (later auto-validate rounds re-enter the fork)
+	cwd: string;
+	timeoutMs: number;
+	signal?: AbortSignal; // escape key — kill this child and settle it as "aborted"
+}
+
+/** Strip provider/runtime prefixes so Claude Code gets a bare model alias or id. */
+function claudeModelId(model: string): string {
+	return model.replace(/^(anthropic|claude-cli)\//i, "").trim() || model;
+}
+
+/** Map harness thinking levels onto Claude Code `--effort` (unsupported → omitted). */
+function claudeEffort(thinking: ThinkingLevel): string | undefined {
+	if (thinking === "off" || thinking === "minimal") return undefined;
+	if (thinking === "low" || thinking === "medium" || thinking === "high" || thinking === "xhigh" || thinking === "max") {
+		return thinking;
+	}
+	return undefined;
+}
+
+/**
+ * Translate pi tool matrices into Claude Code headless permission flags.
+ * `dontAsk` never blocks on approval (denied tools no-op); `full` bypasses checks.
+ * Do NOT use `--bare` here — it disables Claude subscription OAuth.
+ */
+function claudeAccessArgs(tools: string | "none"): string[] {
+	if (tools === "none") return ["--permission-mode", "dontAsk", "--tools", ""];
+	const set = new Set(
+		tools
+			.split(",")
+			.map((t) => t.trim().toLowerCase())
+			.filter(Boolean),
+	);
+	const allowed: string[] = [];
+	if (set.has("read") || set.has("ls")) allowed.push("Read");
+	if (set.has("grep") || set.has("find")) allowed.push("Grep", "Glob");
+	if (set.has("bash")) allowed.push("Bash");
+	if (set.has("edit")) allowed.push("Edit");
+	if (set.has("write")) allowed.push("Write");
+	// Opinion/readonly research often benefits from web tools without granting writes.
+	if (!set.has("write") && !set.has("edit")) allowed.push("WebFetch", "WebSearch");
+	const uniq = [...new Set(allowed)];
+	// Full project-mutating toolsets match the old pi FULL_TOOLS posture.
+	if (set.has("bash") && set.has("edit") && set.has("write")) {
+		return ["--dangerously-skip-permissions"];
+	}
+	return ["--permission-mode", "dontAsk", "--allowedTools", uniq.join(",")];
+}
+
+function resolveClaudeBin(): string {
+	const fromEnv = process.env.CLAUDE_CLI?.trim() || process.env.CLAUDE_PATH?.trim();
+	if (fromEnv) return fromEnv;
+	return "claude";
+}
+
+/** Settle helpers shared by backends. */
+function beginChildRun(run: AgentRun, thinking: ThinkingLevel, signal?: AbortSignal): { started: number; abortedEarly: boolean } {
+	const started = Date.now();
+	run.thinking = thinking;
+	if (signal?.aborted) {
+		run.status = "aborted";
+		run.startedAt = started;
+		run.endedAt = started;
+		run.ms = 0;
+		run.exitCode = 130;
+		return { started, abortedEarly: true };
+	}
+	run.status = "working";
+	run.startedAt = started;
+	run.flowMark = run.flow.length;
+	return { started, abortedEarly: false };
+}
+
+function attachKillSwitch(
+	proc: ReturnType<typeof spawn>,
+	opts: { signal?: AbortSignal; timeoutMs: number },
+	flags: { timedOut: boolean; aborted: boolean },
+): { cleanup: () => void } {
+	const killChild = () => {
+		try {
+			proc.kill("SIGTERM");
+		} catch {
+			/* already gone */
+		}
+		setTimeout(() => {
+			if (!proc.killed) {
+				try {
+					proc.kill("SIGKILL");
+				} catch {
+					/* already gone */
+				}
+			}
+		}, KILL_GRACE_MS);
+	};
+	const onAbort = () => {
+		flags.aborted = true;
+		killChild();
+	};
+	opts.signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(() => {
+		flags.timedOut = true;
+		killChild();
+	}, opts.timeoutMs);
+	return {
+		cleanup: () => {
+			clearTimeout(timer);
+			opts.signal?.removeEventListener("abort", onAbort);
+		},
+	};
+}
+
+function settleChildRun(run: AgentRun, started: number, flags: { timedOut: boolean; aborted: boolean }): void {
+	run.endedAt = Date.now();
+	run.ms = run.endedAt - started;
+	// abort wins over runOk: a killed child may still have emitted usable text, but the
+	// user asked it to stop — reporting "done" would silently accept a partial answer.
+	run.status = flags.aborted ? "aborted" : runOk(run) ? "done" : flags.timedOut ? "timeout" : "failed";
+	run.streamText = "";
+	run.streamThinking = "";
+}
+
+/**
+ * Spawn one child agent and stream progress into `run`.
+ * Dispatches to the pi JSON backend or Claude Code CLI backend.
+ */
+function runChild(opts: RunChildOpts): Promise<AgentRun> {
+	const backend = opts.backend ?? DEFAULT_BACKEND;
+	if (backend === "claude-cli") return runClaudeChild(opts);
+	return runPiChild(opts);
+}
+
 /**
  * Spawn one `pi --mode json -p` child agent and stream its JSON events into `run`.
  * Final answer = last assistant text part. The child writes its session into a
  * throwaway --session-dir under the run's /tmp artifacts dir.
  */
-function runChild(opts: {
-	run: AgentRun; // mutated live
-	prompt: string;
-	systemPrompt?: string;
-	tools: string | "none";
-	thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-	sessionDir: string;
-	sessionId?: string; // stable per-role session — the agent keeps its context across commands
-	fork?: string; // fork this session FILE (copy-on-write) — the child inherits the host's full context
-	resume?: string; // resume this session id inside sessionDir (later auto-validate rounds re-enter the fork)
-	cwd: string;
-	timeoutMs: number;
-	signal?: AbortSignal; // escape key — kill this child and settle it as "aborted"
-}): Promise<AgentRun> {
+function runPiChild(opts: RunChildOpts): Promise<AgentRun> {
 	const run = opts.run;
-	run.thinking = opts.thinking;
+	const { started, abortedEarly } = beginChildRun(run, opts.thinking, opts.signal);
+	if (abortedEarly) return Promise.resolve(run);
+
 	// Clean-room spawn: children never load skills, extensions (recursion guard), or
 	// context files — their entire contract comes from the harness's prompt files.
 	const args: string[] = [
@@ -466,7 +608,7 @@ function runChild(opts: {
 		"--thinking",
 		opts.thinking,
 		"--model",
-		run.model,
+		run.model.startsWith("claude-cli/") ? run.model.slice("claude-cli/".length) : run.model,
 	];
 	// Session identity, in precedence order: fork the host > resume an earlier fork > pinned per-role id.
 	if (opts.fork) args.push("--fork", opts.fork);
@@ -478,24 +620,8 @@ function runChild(opts: {
 	args.push(opts.prompt);
 
 	return new Promise<AgentRun>((resolve) => {
-		const started = Date.now();
 		let buffer = "";
-		let timedOut = false;
-		let aborted = false;
-		// Already stopped before this stage began (e.g. escape during the previous agent):
-		// settle without spawning, so an abort never starts new model work.
-		if (opts.signal?.aborted) {
-			run.status = "aborted";
-			run.startedAt = started;
-			run.endedAt = started;
-			run.ms = 0;
-			run.exitCode = 130;
-			resolve(run);
-			return;
-		}
-		run.status = "working";
-		run.startedAt = started;
-		run.flowMark = run.flow.length;
+		const flags = { timedOut: false, aborted: false };
 
 		// One line of the child's JSON event stream → the relevant AgentRun mutation.
 		const processLine = (line: string) => {
@@ -561,15 +687,6 @@ function runChild(opts: {
 			}
 		};
 
-		const settle = () => {
-			run.endedAt = Date.now();
-			run.ms = run.endedAt - started;
-			// abort wins over runOk: a killed child may still have emitted usable text, but the
-			// user asked it to stop — reporting "done" would silently accept a partial answer.
-			run.status = aborted ? "aborted" : runOk(run) ? "done" : timedOut ? "timeout" : "failed";
-			run.streamText = "";
-		};
-
 		const invocation = piInvocation(args);
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd: opts.cwd,
@@ -578,6 +695,7 @@ function runChild(opts: {
 			// Children still make their real model API calls — this only skips startup chores.
 			env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" },
 		});
+		const { cleanup } = attachKillSwitch(proc, opts, flags);
 
 		// Line-buffer stdout: events arrive one JSON object per line, possibly split across chunks.
 		proc.stdout?.on("data", (data: Buffer) => {
@@ -589,66 +707,258 @@ function runChild(opts: {
 		proc.stderr?.on("data", (data: Buffer) => {
 			run.stderr += data.toString();
 		});
-		// SIGTERM, then SIGKILL after the grace period — same escalation as the timeout path.
-		const killChild = () => {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* already gone */
-			}
-			setTimeout(() => {
-				if (!proc.killed) {
-					try {
-						proc.kill("SIGKILL");
-					} catch {
-						/* already gone */
-					}
-				}
-			}, KILL_GRACE_MS);
-		};
-		const onAbort = () => {
-			aborted = true;
-			killChild();
-		};
-		opts.signal?.addEventListener("abort", onAbort, { once: true });
-		const cleanup = () => {
-			clearTimeout(timer);
-			opts.signal?.removeEventListener("abort", onAbort);
-		};
 
 		proc.on("close", (code) => {
 			if (buffer.trim()) processLine(buffer); // flush a final unterminated line
-			run.exitCode = aborted ? 130 : timedOut ? 124 : (code ?? 0);
+			run.exitCode = flags.aborted ? 130 : flags.timedOut ? 124 : (code ?? 0);
 			cleanup();
-			settle();
+			settleChildRun(run, started, flags);
 			resolve(run);
 		});
 		proc.on("error", (err) => {
 			run.stderr += `\nspawn error: ${String(err)}`;
 			run.exitCode = 1;
 			cleanup();
-			settle();
+			settleChildRun(run, started, flags);
 			resolve(run);
 		});
+	});
+}
 
-		// Wall-clock timeout: same SIGTERM → SIGKILL escalation as the abort path.
-		const timer = setTimeout(() => {
-			timedOut = true;
+/**
+ * Spawn one `claude -p` child (Claude Code CLI) and map stream-json events → AgentRun.
+ *
+ * Why this exists: pi's Anthropic OAuth path bills third-party harness use as extra usage.
+ * Claude Code's own CLI consumes normal Claude subscription usage. Fusion keeps the same
+ * AgentRun/UI contract; only the process boundary changes.
+ *
+ * Capabilities vs pi:
+ *   - sessions: --session-id / --resume (no host --fork)
+ *   - tools: dontAsk allowlists (or skip-permissions for full write+bash)
+ *   - clean-room best-effort: --disable-slash-commands, --setting-sources user
+ *   - auth: Claude Code login/subscription (never --bare, which forces API-key-only)
+ */
+function runClaudeChild(opts: RunChildOpts): Promise<AgentRun> {
+	const run = opts.run;
+	const { started, abortedEarly } = beginChildRun(run, opts.thinking, opts.signal);
+	if (abortedEarly) return Promise.resolve(run);
+
+	const modelId = claudeModelId(run.model);
+	const args: string[] = [
+		"-p",
+		"--output-format",
+		"stream-json",
+		"--verbose",
+		"--include-partial-messages",
+		// Best-effort clean-room: no skills slash commands; user settings only (keeps OAuth).
+		"--disable-slash-commands",
+		"--setting-sources",
+		"user",
+		"--model",
+		modelId,
+		...claudeAccessArgs(opts.tools),
+	];
+
+	const effort = claudeEffort(opts.thinking);
+	if (effort) args.push("--effort", effort);
+
+	// Host fork is pi-native. Claude backend falls back to resume/session-id.
+	if (opts.fork) {
+		run.stderr += "[claude-cli] host --fork is pi-only; using Claude session resume/id instead\n";
+	}
+	if (opts.resume) args.push("--resume", opts.resume);
+	else if (opts.sessionId) args.push("--session-id", opts.sessionId);
+
+	// Prefer replace when the harness supplies a full contract; otherwise leave Claude defaults.
+	if (opts.systemPrompt) args.push("--system-prompt", opts.systemPrompt);
+
+	// Prompt on stdin — fusion handoffs can exceed argv limits.
+	return new Promise<AgentRun>((resolve) => {
+		let buffer = "";
+		const flags = { timedOut: false, aborted: false };
+		let sawResultError = false;
+		let partialText = "";
+		let partialThinking = "";
+
+		const processLine = (line: string) => {
+			if (!line.trim()) return;
+			let event: any;
 			try {
-				proc.kill("SIGTERM");
+				event = JSON.parse(line);
 			} catch {
-				/* ignore */
+				return;
 			}
-			setTimeout(() => {
-				if (!proc.killed) {
-					try {
-						proc.kill("SIGKILL");
-					} catch {
-						/* ignore */
+			const t = event?.type;
+
+			// Session bootstrap
+			if (t === "system" && (event.subtype === "init" || event.session_id)) {
+				const sid = event.session_id ?? event.sessionId;
+				if (typeof sid === "string" && sid) run.sessionRef = sid;
+				return;
+			}
+
+			// Streaming deltas (with --include-partial-messages)
+			if (t === "stream_event" || t === "content_block_delta") {
+				const ev = event.event ?? event;
+				const delta = ev?.delta ?? event.delta;
+				if (delta?.type === "text_delta" && typeof delta.text === "string") {
+					partialText += delta.text;
+					run.streamText = partialText;
+				} else if (
+					(delta?.type === "thinking_delta" || delta?.type === "reasoning_delta") &&
+					typeof (delta.thinking ?? delta.text) === "string"
+				) {
+					partialThinking += delta.thinking ?? delta.text;
+					run.streamThinking = partialThinking;
+				}
+				return;
+			}
+
+			// Assistant messages: tools + completed text/thinking blocks
+			if (t === "assistant") {
+				const content = event.message?.content ?? event.content ?? [];
+				for (const block of content) {
+					if (!block || typeof block !== "object") continue;
+					if (block.type === "tool_use") {
+						run.toolCalls++;
+						const name = block.name ?? "?";
+						const arg = briefArg(block.input ?? {});
+						run.flow.push({ type: "tool", label: arg ? `${name} ${arg}` : name });
+					} else if (block.type === "text" && block.text?.trim()) {
+						run.text = block.text;
+						run.flow.push({ type: "text", text: block.text });
+						partialText = "";
+						run.streamText = "";
+					} else if ((block.type === "thinking" || block.type === "reasoning") && (block.thinking ?? block.text)?.trim()) {
+						const th = block.thinking ?? block.text;
+						run.flow.push({ type: "thinking", text: th });
+						partialThinking = "";
+						run.streamThinking = "";
 					}
 				}
-			}, KILL_GRACE_MS);
-		}, opts.timeoutMs);
+				return;
+			}
+
+			// Terminal result envelope from Claude Code
+			if (t === "result") {
+				if (typeof event.session_id === "string" && event.session_id) run.sessionRef = event.session_id;
+				if (typeof event.result === "string" && event.result.trim()) {
+					run.text = event.result;
+					// Avoid duplicating if the same text was already pushed from assistant events.
+					const last = run.flow[run.flow.length - 1];
+					if (!(last && last.type === "text" && last.text === event.result)) {
+						run.flow.push({ type: "text", text: event.result });
+					}
+				} else if (partialText.trim() && !run.text.trim()) {
+					run.text = partialText;
+				}
+				if (event.is_error) {
+					sawResultError = true;
+					run.errorMessage = typeof event.result === "string" && event.result ? event.result : "claude result is_error";
+				}
+				if (typeof event.total_cost_usd === "number") run.costUsd += event.total_cost_usd;
+				const usage = event.usage ?? event.total_usage ?? {};
+				const input =
+					(usage.input_tokens ?? usage.input ?? 0) +
+					(usage.cache_read_input_tokens ?? usage.cache_read ?? 0) +
+					(usage.cache_creation_input_tokens ?? usage.cache_write ?? 0);
+				const output = usage.output_tokens ?? usage.output ?? 0;
+				if (input) run.tokensIn += input;
+				if (output) run.tokensOut += output;
+				const ctx = input + output;
+				if (ctx > 0) run.ctxTokens = ctx;
+				run.streamText = "";
+				run.streamThinking = "";
+				partialText = "";
+				partialThinking = "";
+			}
+		};
+
+		const bin = resolveClaudeBin();
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(bin, args, {
+				cwd: opts.cwd,
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+				env: { ...process.env },
+			});
+		} catch (err) {
+			run.stderr += `\nspawn error: ${String(err)}`;
+			run.errorMessage = `failed to spawn ${bin}: ${String(err)}`;
+			run.exitCode = 127;
+			settleChildRun(run, started, flags);
+			resolve(run);
+			return;
+		}
+
+		const { cleanup } = attachKillSwitch(proc, opts, flags);
+
+		proc.stdout?.on("data", (data: Buffer) => {
+			buffer += data.toString();
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || "";
+			for (const line of lines) processLine(line);
+		});
+		proc.stderr?.on("data", (data: Buffer) => {
+			run.stderr += data.toString();
+		});
+
+		try {
+			proc.stdin?.write(opts.prompt);
+			proc.stdin?.end();
+		} catch (err) {
+			run.stderr += `\nstdin error: ${String(err)}`;
+		}
+
+		proc.on("close", (code) => {
+			if (buffer.trim()) processLine(buffer);
+			// If we only streamed partials, promote them to the final answer.
+			if (!run.text.trim() && partialText.trim()) {
+				run.text = partialText;
+				run.flow.push({ type: "text", text: partialText });
+			}
+			run.exitCode = flags.aborted ? 130 : flags.timedOut ? 124 : (code ?? 0);
+			if (sawResultError && run.exitCode === 0) run.exitCode = 1;
+			if (!run.text.trim() && run.exitCode !== 0 && !run.errorMessage) {
+				run.errorMessage = run.stderr.trim().split("\n").slice(-8).join("\n") || `claude exited ${run.exitCode}`;
+			}
+			cleanup();
+			settleChildRun(run, started, flags);
+			// Persist a debug trace next to the role session when possible.
+			try {
+				fs.mkdirSync(opts.sessionDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(opts.sessionDir, "claude-last-status.json"),
+					JSON.stringify(
+						{
+							model: modelId,
+							exitCode: run.exitCode,
+							status: run.status,
+							sessionRef: run.sessionRef,
+							tokensIn: run.tokensIn,
+							tokensOut: run.tokensOut,
+							costUsd: run.costUsd,
+							errorMessage: run.errorMessage,
+						},
+						null,
+						2,
+					),
+					"utf-8",
+				);
+			} catch {
+				/* non-fatal */
+			}
+			resolve(run);
+		});
+		proc.on("error", (err) => {
+			run.stderr += `\nspawn error: ${String(err)}`;
+			run.errorMessage = `failed to spawn ${bin}: ${String(err)}`;
+			run.exitCode = 127;
+			cleanup();
+			settleChildRun(run, started, flags);
+			resolve(run);
+		});
 	});
 }
 
@@ -935,6 +1245,16 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 		description: `BUILDER model (provider/id) — builds. Default ${DEFAULT_BUILDER}.`,
 	});
+	pi.registerFlag("architect-backend", {
+		type: "string",
+		description:
+			"Child runtime for ARCHITECT-family agents (worker/fusion/validator/triage): pi | claude-cli. Default pi. claude-cli runs `claude -p` so Claude subscription usage applies (not pi Anthropic OAuth extra usage).",
+	});
+	pi.registerFlag("builder-backend", {
+		type: "string",
+		description:
+			"Child runtime for BUILDER agents: pi | claude-cli. Default pi. Host chat stays on pi regardless — only spawned builder children use this backend.",
+	});
 	pi.registerFlag("max-validations", {
 		type: "string",
 		description: "Max gate validations (build attempts) for /auto-validate before development halts. Default 5. Also overridable inline: /auto-validate --max-validations 3 <prompt>.",
@@ -976,6 +1296,22 @@ export default function (pi: ExtensionAPI) {
 	};
 	const architectModel = () => flagStr("architect") || DEFAULT_ARCHITECT; // resolved per call — flags are static, but cheap to re-read
 	const builderModel = () => flagStr("builder") || DEFAULT_BUILDER;
+
+	/** Parse pi|claude-cli; unknown values fall back to pi. */
+	const parseBackend = (raw: string): ChildBackend => {
+		const v = raw.trim().toLowerCase();
+		if (v === "claude-cli" || v === "claude" || v === "claude_code" || v === "claude-code") return "claude-cli";
+		return "pi";
+	};
+	const roleBackend = (side: "architect" | "builder"): ChildBackend =>
+		parseBackend(flagStr(`${side}-backend`) || DEFAULT_BACKEND);
+	/** Display label that makes the runtime obvious in panels/footers. */
+	const roleModelLabel = (side: "architect" | "builder"): string => {
+		const model = side === "architect" ? architectModel() : builderModel();
+		const backend = roleBackend(side);
+		if (backend === "claude-cli") return `claude-cli/${claudeModelId(model)}`;
+		return model;
+	};
 
 	/** --<role>-system-prompt: inline text, or a file path (file contents win if it exists). */
 	const roleSystemPrompt = (role: "architect" | "builder"): string | undefined => {
@@ -1087,7 +1423,10 @@ export default function (pi: ExtensionAPI) {
 	// brain for that model; switching back resumes the old one.
 	const roleSessions: Record<string, { id: string; dir: string }> = {};
 	const roleModel = (side: "architect" | "builder"): string => (side === "architect" ? architectModel() : builderModel());
-	const roleKey = (side: "architect" | "builder"): string => `${side}:${modelTag(roleModel(side))}`;
+	// Keyed per role + backend + model: a pi transcript must never resume as a Claude session
+	// (and vice versa), and model swaps still mint separate brains as before.
+	const roleKey = (side: "architect" | "builder"): string =>
+		`${side}:${roleBackend(side)}:${modelTag(roleModelLabel(side))}`;
 	const roleSession = (side: "architect" | "builder", cwd: string): { id: string; dir: string } => {
 		const key = roleKey(side);
 		const cached = roleSessions[key];
@@ -1157,7 +1496,18 @@ export default function (pi: ExtensionAPI) {
 	 * throwaway instead makes it amnesiac on every command (a visible ~1k cold-start prompt
 	 * each time, while the ARCHITECT accumulates in its own persistent session).
 	 */
-	const builderSpawn = (ctx: any, artifactsDir: string): { fork?: string; sessionDir: string; sessionId?: string } => {
+	const builderSpawn = (
+		ctx: any,
+		artifactsDir: string,
+		backend: ChildBackend = "pi",
+	): { fork?: string; sessionDir: string; sessionId?: string; resume?: string } => {
+		// Claude Code cannot fork a pi host session file — use the persistent builder brain.
+		if (backend === "claude-cli") {
+			const s = roleSession("builder", ctx.cwd);
+			// Prefer resume when the prior claude child recorded a sessionRef in sideLast/run —
+			// the manifest UUID is still passed as --session-id on first touch.
+			return { sessionDir: s.dir, sessionId: s.id };
+		}
 		let hostFile: string | undefined;
 		try {
 			hostFile = ctx.sessionManager.getSessionFile?.();
@@ -1303,7 +1653,7 @@ export default function (pi: ExtensionAPI) {
 							// thinking_level_changed event, so it isn't reachable from a footer.
 							return cellStr(theme, "BUILDER", hostModel, roleThinking("builder"), bar(used, window));
 						}
-						const model = active?.model ?? (side === "left" ? architectModel() : builderModel());
+						const model = active?.model ?? (side === "left" ? roleModelLabel("architect") : roleModelLabel("builder"));
 						const thinking = active?.thinking ?? roleThinking(side === "left" ? "architect" : "builder");
 						// ctxTokens only exists once a child reports its FIRST message_end. An agent that
 						// is still on its opening turn (a big persistent session at xhigh can think for
@@ -1765,8 +2115,10 @@ export default function (pi: ExtensionAPI) {
 			const prompt = parsed.prompt;
 			const fusionInstruction = parsed.fusion || defaultFusionPrompt();
 
-			const aModel = architectModel();
-			const bModel = builderModel();
+			const aModel = roleModelLabel("architect");
+			const bModel = roleModelLabel("builder");
+			const aBackend = roleBackend("architect");
+			const bBackend = roleBackend("builder");
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", `${prompt}\n\nFUSION INSTRUCTION:\n${fusionInstruction}`);
@@ -1802,6 +2154,7 @@ export default function (pi: ExtensionAPI) {
 				await Promise.all([
 					runChild({
 						run: architect,
+						backend: aBackend,
 						prompt: workerPrompt("ARCHITECT", aModel, "BUILDER", bModel, prompt),
 						systemPrompt: roleSystemPrompt("architect"),
 						tools: FULL_TOOLS,
@@ -1814,11 +2167,12 @@ export default function (pi: ExtensionAPI) {
 					}),
 					runChild({
 						run: builder,
+						backend: bBackend,
 						prompt: workerPrompt("BUILDER", bModel, "ARCHITECT", aModel, prompt),
 						systemPrompt: roleSystemPrompt("builder"),
 						tools: FULL_TOOLS,
 						thinking: roleThinking("builder"),
-						...builderSpawn(ctx, artifactsDir),
+						...builderSpawn(ctx, artifactsDir, bBackend),
 						cwd: ctx.cwd,
 						timeoutMs: childTimeoutMs(),
 						signal: stopper.signal,
@@ -1872,6 +2226,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.setStatus(CUSTOM_TYPE, "fusion: fusing…");
 				await runChild({
 					run: fuser,
+					backend: aBackend,
 					prompt: fuserPrompt(
 						fusionInstruction,
 						prompt,
@@ -1978,8 +2333,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const prompt = input;
-			const aModel = architectModel();
-			const bModel = builderModel();
+			const aModel = roleModelLabel("architect");
+			const bModel = roleModelLabel("builder");
+			const aBackend = roleBackend("architect");
+			const bBackend = roleBackend("builder");
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", prompt);
@@ -2023,6 +2380,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.setStatus(CUSTOM_TYPE, "auto-validate: validator designing the gate…");
 				await runChild({
 					run: validator,
+					backend: aBackend,
 					prompt: validatorPrompt(prompt, ctx.cwd, scriptPath),
 					systemPrompt: validatorSystem(scriptPath),
 					tools: VALIDATOR_TOOLS,
@@ -2116,7 +2474,7 @@ export default function (pi: ExtensionAPI) {
 				let pendingTriage: string | undefined;
 				let pendingGateUpdate: string | undefined; // repaired gate → next correction prompt (round-1 copy is stale)
 				let gateRepairUsed = false; // ONE repair per run — the grader never gets to keep moving goalposts
-				const firstSpawn = builderSpawn(ctx, artifactsDir);
+				const firstSpawn = builderSpawn(ctx, artifactsDir, bBackend);
 				for (let round = 1; round <= maxV; round++) {
 					const triageBrief = pendingTriage;
 					pendingTriage = undefined;
@@ -2131,6 +2489,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.setStatus(CUSTOM_TYPE, `auto-validate: builder — round ${round}/${maxV}…`);
 					await runChild({
 						run: builder,
+						backend: bBackend,
 						prompt: round === 1 ? builderPrompt(prompt, script) : correctionPrompt(round, maxV, lastGate!.code, lastGate!.output, triageBrief, gateUpdate),
 						systemPrompt: roleSystemPrompt("builder"),
 						tools: FULL_TOOLS,
@@ -2230,6 +2589,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						await runChild({
 							run: validator,
+							backend: aBackend,
 							prompt: triagePrompt(prompt, round, maxV, builder.text, gateHistory, artifactsDir),
 							systemPrompt: triageSystem(scriptPath),
 							// Repair power is enforced by TOOLS, not trust: while the run's single
@@ -2410,8 +2770,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /opinion <prompt>", "warning");
 				return;
 			}
-			const aModel = architectModel();
-			const bModel = builderModel();
+			const aModel = roleModelLabel("architect");
+			const bModel = roleModelLabel("builder");
+			const aBackend = roleBackend("architect");
+			const bBackend = roleBackend("builder");
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", prompt);
@@ -2428,6 +2790,7 @@ export default function (pi: ExtensionAPI) {
 				await Promise.all([
 					runChild({
 						run: architect,
+						backend: aBackend,
 						prompt: opinionPrompt(prompt),
 						systemPrompt: roleSystemPrompt("architect"),
 						tools: OPINION_TOOLS,
@@ -2440,11 +2803,12 @@ export default function (pi: ExtensionAPI) {
 					}),
 					runChild({
 						run: builder,
+						backend: bBackend,
 						prompt: opinionPrompt(prompt),
 						systemPrompt: roleSystemPrompt("builder"),
 						tools: OPINION_TOOLS,
 						thinking: roleThinking("builder"),
-						...builderSpawn(ctx, artifactsDir),
+						...builderSpawn(ctx, artifactsDir, bBackend),
 						cwd: ctx.cwd,
 						timeoutMs: childTimeoutMs(),
 						signal: stopper.signal,
